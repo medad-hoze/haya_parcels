@@ -436,7 +436,14 @@
     ),
   };
 
-  const map = L.map('map', { zoomControl: true });
+  // preferCanvas:true => Leaflet renders vector layers (our parcels) onto an
+  // HTML canvas instead of SVG. Critical for PDF export: html2canvas reliably
+  // captures canvas content, but it loses Leaflet's SVG layer (which is
+  // positioned via CSS translate3d). Hover/popups/tooltips still work fine.
+  const map = L.map('map', { zoomControl: true, preferCanvas: true });
+  // Explicit renderer with padding so polygons near the viewport edge aren't
+  // clipped during pan/zoom and show up in full when captured.
+  const canvasRenderer = L.canvas({ padding: 0.5 });
   let currentBase = BASEMAPS['CartoDB - Voyager'];
   currentBase.addTo(map);
 
@@ -635,6 +642,7 @@
     if (layer) map.removeLayer(layer);
     const styleFn = buildStyleFn();
     layer = L.geoJSON(GEOJSON, {
+      renderer: canvasRenderer,
       filter: passesFilters,
       style: styleFn,
       onEachFeature: (feature, lyr) => {
@@ -763,6 +771,48 @@
     ctx.restore();
   }
 
+  // Captures the legend from an off-screen clone so it works even when the
+  // symbology panel is collapsed (collapsed panel body = display:none =
+  // html2canvas returns a 0x0 canvas, which crashes drawImage downstream).
+  async function captureLegendOffscreen() {
+    const src = document.getElementById('legend');
+    const clone = src.cloneNode(true);
+    Object.assign(clone.style, {
+      position: 'absolute',
+      top: '-99999px',
+      left: '0',
+      display: 'block',
+      visibility: 'visible',
+      width: '300px',
+      maxHeight: 'none',
+      overflow: 'visible',
+      background: '#ffffff',
+      border: '1px solid #ddd',
+      borderRadius: '4px',
+      padding: '12px',
+      fontFamily: '"Segoe UI", "Arial Hebrew", Arial, sans-serif',
+      fontSize: '12px',
+      direction: 'rtl',
+      color: '#2c3e50',
+      zIndex: '-1',
+    });
+    document.body.appendChild(clone);
+    try {
+      // Force layout so the clone has real measurements
+      // (offsetHeight read forces a reflow)
+      void clone.offsetHeight;
+      const canvas = await html2canvas(clone, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        logging: false,
+      });
+      if (!canvas || canvas.width === 0 || canvas.height === 0) return null;
+      return canvas;
+    } finally {
+      document.body.removeChild(clone);
+    }
+  }
+
   async function exportToPdf() {
     const btn = document.getElementById('btnExportPdf');
     btn.disabled = true;
@@ -810,15 +860,16 @@
 
       mapEl.classList.remove('capturing');
 
+      // Sanity: html2canvas returns a 0x0 canvas if the element (or any ancestor)
+      // has display:none. The map element is always visible, but check anyway.
+      if (!mapCanvas || mapCanvas.width === 0 || mapCanvas.height === 0) {
+        throw new Error('לכידת המפה נכשלה (גודל קנבס 0). ודא שחלון הדפדפן גלוי.');
+      }
+
       let legendCanvas = null;
       if (wantLegend && state.colorBy) {
         showLoading('לוכד מקרא...');
-        const legendEl = document.getElementById('legend');
-        legendCanvas = await html2canvas(legendEl, {
-          backgroundColor: '#ffffff',
-          scale: 2,
-          logging: false,
-        });
+        legendCanvas = await captureLegendOffscreen();
       }
 
       showLoading('מרכיב את הדף...');
@@ -881,7 +932,7 @@
       }
 
       // Legend at top-left of map area
-      if (legendCanvas) {
+      if (legendCanvas && legendCanvas.width > 0 && legendCanvas.height > 0) {
         const targetW = Math.min(Math.round(60 * PX_PER_MM), drawW * 0.32);
         const lAR = legendCanvas.width / legendCanvas.height;
         const lDrawW = targetW;
