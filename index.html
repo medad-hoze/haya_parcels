@@ -158,6 +158,15 @@
   .parcel-label .lbl-field { color: var(--muted); font-size: 9px; font-weight: 500; }
   .parcel-label .lbl-value { color: #1f4e79; }
 
+  /* Small dot rendered at the polygon centroid (anchor for the label) */
+  .parcel-dot {
+    background: #1f6feb;
+    border: 1.5px solid #ffffff;
+    border-radius: 50%;
+    box-shadow: 0 0 3px rgba(0,0,0,0.45);
+    pointer-events: none;
+  }
+
   /* ---- PDF export loading overlay ---- */
   #loadingOverlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.55);
@@ -462,6 +471,13 @@
     currentBase.addTo(map);
   });
 
+  // Screen-space label collisions change with zoom (polygons grow/shrink in
+  // pixels), so re-run the layout pass on zoom end. Pan doesn't need this:
+  // markers stay anchored to lat/lng and shift uniformly with the map.
+  map.on('zoomend', () => {
+    if (state.labelFields.length > 0) applyLabels();
+  });
+
   // -------- Symbology --------
   const PALETTES = {
     categorical: ['#e41a1c','#377eb8','#4daf4a','#984ea3','#ff7f00','#ffd92f',
@@ -692,20 +708,136 @@
     return lines.join('<br>');
   }
 
+  // ---- Collision-aware label placement ----
+  let labelLayerGroup = null;
+
+  function getPolygonCenter(lyr) {
+    try {
+      if (typeof lyr.getCenter === 'function') return lyr.getCenter();
+    } catch (e) {}
+    return lyr.getBounds().getCenter();
+  }
+
+  // Render a hidden copy to measure exact label size (text length, line count)
+  function estimateLabelSize(html) {
+    const probe = document.createElement('div');
+    probe.className = 'parcel-label';
+    probe.style.cssText = 'position:absolute;visibility:hidden;left:-9999px;top:0;';
+    probe.innerHTML = html;
+    document.body.appendChild(probe);
+    const w = probe.offsetWidth;
+    const h = probe.offsetHeight;
+    document.body.removeChild(probe);
+    return { w, h };
+  }
+
+  function rectOverlap(a, b) {
+    return !(a.r <= b.l || a.l >= b.r || a.b <= b.t || a.t >= b.b);
+  }
+
+  // Greedy spiral search: try centroid, then spiral outward until a slot is free
+  function findFreeSlot(centerPt, dims, placed) {
+    const halfW = dims.w / 2 + 2;
+    const halfH = dims.h / 2 + 2;
+    const makeBox = (x, y) => ({ l: x - halfW, r: x + halfW, t: y - halfH, b: y + halfH });
+
+    const initBox = makeBox(centerPt.x, centerPt.y);
+    if (!placed.some(b => rectOverlap(initBox, b))) {
+      return { x: centerPt.x, y: centerPt.y, box: initBox, offset: 0 };
+    }
+
+    // 8 compass directions, each ring further out from the centroid
+    const dirs = [
+      [0, -1], [0, 1], [-1, 0], [1, 0],
+      [-0.7, -0.7], [0.7, -0.7], [-0.7, 0.7], [0.7, 0.7],
+    ];
+    const stepBase = Math.max(dims.h * 1.1, 18);
+
+    for (let r = 1; r <= 6; r++) {
+      for (const [dx, dy] of dirs) {
+        const x = centerPt.x + dx * stepBase * r;
+        const y = centerPt.y + dy * stepBase * r;
+        const box = makeBox(x, y);
+        if (!placed.some(b => rectOverlap(box, b))) {
+          return { x, y, box, offset: stepBase * r };
+        }
+      }
+    }
+    // Couldn't find a free slot — overlap is unavoidable, fall back to centroid
+    return { x: centerPt.x, y: centerPt.y, box: initBox, offset: 0 };
+  }
+
   function applyLabels() {
-    if (!layer) return;
+    // Always tear down any previous layout
+    if (labelLayerGroup) {
+      map.removeLayer(labelLayerGroup);
+      labelLayerGroup = null;
+    }
+    if (!layer || state.labelFields.length === 0) return;
+
+    // Collect items: features with valid label HTML
+    const items = [];
     layer.eachLayer(lyr => {
-      if (lyr.getTooltip()) lyr.unbindTooltip();
-      if (state.labelFields.length === 0) return;
       const html = buildLabelHtml(lyr.feature.properties);
       if (!html) return;
-      lyr.bindTooltip(html, {
-        permanent: true,
-        direction: 'center',
-        className: 'parcel-label',
-        opacity: 1,
-        sticky: false,
-      });
+      const center = getPolygonCenter(lyr);
+      const dims = estimateLabelSize(html);
+      // Polygon area in screen pixels — drives placement priority
+      const b = lyr.getBounds();
+      const sw = map.latLngToContainerPoint(b.getSouthWest());
+      const ne = map.latLngToContainerPoint(b.getNorthEast());
+      const areaPx = Math.abs((ne.x - sw.x) * (sw.y - ne.y));
+      items.push({ center, html, dims, areaPx });
+    });
+    if (items.length === 0) return;
+
+    // Larger polygons get first claim on the prime real-estate (their centroid)
+    items.sort((a, b) => b.areaPx - a.areaPx);
+
+    const placedBoxes = [];
+    labelLayerGroup = L.layerGroup().addTo(map);
+
+    items.forEach(item => {
+      const centerPt = map.latLngToContainerPoint(item.center);
+      const slot = findFreeSlot(centerPt, item.dims, placedBoxes);
+      placedBoxes.push(slot.box);
+
+      const labelLatLng = map.containerPointToLatLng(L.point(slot.x, slot.y));
+
+      // 1. Anchor dot — always at the true polygon centroid
+      L.marker(item.center, {
+        icon: L.divIcon({
+          className: 'parcel-dot',
+          html: '',
+          iconSize: [8, 8],
+          iconAnchor: [4, 4],
+        }),
+        interactive: false,
+        keyboard: false,
+      }).addTo(labelLayerGroup);
+
+      // 2. Leader line — only when the label was actually shifted off-center
+      if (slot.offset > 6) {
+        L.polyline([item.center, labelLatLng], {
+          color: '#1f4e79',
+          weight: 1.2,
+          opacity: 0.7,
+          dashArray: '3,3',
+          interactive: false,
+        }).addTo(labelLayerGroup);
+      }
+
+      // 3. Label box at its computed position
+      L.marker(labelLatLng, {
+        icon: L.divIcon({
+          className: 'parcel-label',
+          html: item.html,
+          iconSize: [item.dims.w, item.dims.h],
+          iconAnchor: [item.dims.w / 2, item.dims.h / 2],
+        }),
+        interactive: false,
+        keyboard: false,
+      }).addTo(labelLayerGroup);
     });
   }
 
