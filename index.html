@@ -169,6 +169,57 @@
     pointer-events: none;
   }
 
+  /* ---- Map annotations (point + text, runtime only) ---- */
+  .annotation-marker-icon { background: transparent; border: none; }
+  .annotation-wrap {
+    display: inline-flex; align-items: center; gap: 4px;
+    direction: ltr;             /* keep pin on visual-left, text on visual-right */
+    white-space: nowrap;
+  }
+  .annotation-pin {
+    flex: 0 0 auto;
+    width: 14px; height: 14px;
+    background: #d62728;
+    border: 2px solid #ffffff;
+    border-radius: 50%;
+    box-shadow: 0 0 4px rgba(0,0,0,0.55);
+  }
+  .annotation-text {
+    background: rgba(255, 245, 157, 0.95);
+    border: 1px solid #c9a227;
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #2c3e50;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+    direction: rtl;
+    line-height: 1.25;
+  }
+
+  /* While in annotation-add mode, force a crosshair cursor everywhere on the map */
+  body.annotation-mode .leaflet-container,
+  body.annotation-mode .leaflet-interactive { cursor: crosshair !important; }
+
+  button.danger { background: #d62728; color: white; border-color: #d62728; }
+  button.danger:hover { background: #b51e20; }
+
+  .ann-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 5px 8px; margin-bottom: 4px;
+    background: #fafbfc; border: 1px solid var(--border);
+    border-radius: 4px; font-size: 12px;
+  }
+  .ann-item .ann-text {
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    direction: rtl; text-align: right;
+  }
+  .ann-item button {
+    background: transparent; border: none; color: var(--muted);
+    font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px;
+  }
+  .ann-item button:hover { color: #d62728; }
+
   /* ---- PDF export loading overlay ---- */
   #loadingOverlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.55);
@@ -312,6 +363,30 @@
       </div>
     </div>
     <!-- ===== END extra layer panel ===== -->
+
+    <!-- ===== Annotations panel ===== -->
+    <div class="panel collapsed" id="panel-annotations">
+      <div class="panel-header" onclick="togglePanel('panel-annotations')">
+        <span>📍 הערות על המפה</span><span class="arrow">▾</span>
+      </div>
+      <div class="panel-body">
+        <button id="btnAnnMode" class="primary" onclick="toggleAnnotationMode()" style="width:100%;">
+          ➕ התחל הוספה
+        </button>
+        <div style="margin-top:6px;font-size:11px;color:var(--muted);">
+          לחץ על הכפתור, ואז לחץ על המפה במיקום הרצוי. ייפתח חלון להזנת טקסט.<br>
+          ההערות זמניות (נמחקות ברענון) ויופיעו ב-PDF.
+        </div>
+
+        <div id="annotationsList" style="margin-top:12px;"></div>
+
+        <button id="btnAnnClear" onclick="clearAnnotations()"
+                style="margin-top:6px;width:100%;display:none;">
+          🗑 נקה את כל ההערות
+        </button>
+      </div>
+    </div>
+    <!-- ===== END annotations panel ===== -->
 
     <!-- ===== PDF export panel ===== -->
     <div class="panel collapsed" id="panel-export">
@@ -1011,6 +1086,137 @@
     document.getElementById('extraControls').style.display = 'none';
     document.getElementById('extraEmpty').style.display = 'block';
   }
+
+  // ================================================================
+  //  MAP ANNOTATIONS  (runtime-only point+text, captured by PDF)
+  // ================================================================
+  const annotations = [];   // [{ id, latlng, text, marker }]
+  let nextAnnId = 1;
+  state.annotationMode = false;
+
+  function buildAnnotationIcon(text) {
+    const html =
+      '<div class="annotation-wrap">' +
+        '<span class="annotation-pin"></span>' +
+        '<span class="annotation-text">' + escapeHtml(text) + '</span>' +
+      '</div>';
+
+    // Probe to get exact pixel size (text length is unbounded)
+    const probe = document.createElement('div');
+    probe.style.cssText = 'position:absolute;visibility:hidden;left:-9999px;top:0;';
+    probe.innerHTML = html;
+    document.body.appendChild(probe);
+    const w = probe.firstElementChild.offsetWidth;
+    const h = probe.firstElementChild.offsetHeight;
+    document.body.removeChild(probe);
+
+    // Pin sits at the start (LTR-left) of the wrapper. Anchor at pin center
+    // so the marker latlng is exactly where the pin is, with text trailing right.
+    return L.divIcon({
+      className: 'annotation-marker-icon',
+      html,
+      iconSize: [w, h],
+      iconAnchor: [7, h / 2],
+    });
+  }
+
+  function addAnnotation(latlng, text) {
+    const id = nextAnnId++;
+    const marker = L.marker(latlng, {
+      icon: buildAnnotationIcon(text),
+      riseOnHover: true,
+      keyboard: false,
+    }).addTo(map);
+
+    marker.on('click', () => {
+      if (confirm('למחוק את ההערה?\n\n"' + text + '"')) {
+        removeAnnotation(id);
+      }
+    });
+
+    annotations.push({ id, latlng, text, marker });
+    renderAnnotationsList();
+  }
+
+  function removeAnnotation(id) {
+    const idx = annotations.findIndex(a => a.id === id);
+    if (idx === -1) return;
+    map.removeLayer(annotations[idx].marker);
+    annotations.splice(idx, 1);
+    renderAnnotationsList();
+  }
+
+  function clearAnnotations() {
+    if (annotations.length === 0) return;
+    if (!confirm('למחוק את כל ' + annotations.length + ' ההערות?')) return;
+    annotations.forEach(a => map.removeLayer(a.marker));
+    annotations.length = 0;
+    renderAnnotationsList();
+  }
+
+  function renderAnnotationsList() {
+    const list = document.getElementById('annotationsList');
+    const clearBtn = document.getElementById('btnAnnClear');
+    if (annotations.length === 0) {
+      list.innerHTML = '<div style="font-size:11px;color:var(--muted);text-align:center;padding:8px;">' +
+                       'אין הערות עדיין.</div>';
+      clearBtn.style.display = 'none';
+      return;
+    }
+    list.innerHTML = annotations.map((a, i) =>
+      '<div class="ann-item">' +
+        '<span style="color:var(--muted);font-size:11px;">' + (i + 1) + '.</span>' +
+        '<span class="ann-text" title="' + escapeHtml(a.text) + '">' + escapeHtml(a.text) + '</span>' +
+        '<button title="מחק" onclick="removeAnnotation(' + a.id + ')">×</button>' +
+      '</div>'
+    ).join('');
+    clearBtn.style.display = '';
+  }
+
+  function toggleAnnotationMode() {
+    state.annotationMode = !state.annotationMode;
+    document.body.classList.toggle('annotation-mode', state.annotationMode);
+    const btn = document.getElementById('btnAnnMode');
+    if (state.annotationMode) {
+      btn.textContent = '✓ סיים הוספה';
+      btn.classList.remove('primary');
+      btn.classList.add('danger');
+    } else {
+      btn.textContent = '➕ התחל הוספה';
+      btn.classList.remove('danger');
+      btn.classList.add('primary');
+    }
+  }
+
+  // Capture-phase click on the map element. This runs BEFORE Leaflet's own
+  // click routing, so it intercepts clicks that would otherwise open a
+  // parcel popup. Without this, you could only drop annotations on empty
+  // basemap areas.
+  document.getElementById('map').addEventListener('click', (e) => {
+    if (!state.annotationMode) return;
+    // Don't hijack clicks on Leaflet UI controls or existing annotation markers
+    if (e.target.closest('.leaflet-control')) return;
+    if (e.target.closest('.annotation-marker-icon')) return;
+
+    e.stopImmediatePropagation();
+    e.preventDefault();
+
+    const latlng = map.mouseEventToLatLng(e);
+    const text = prompt('טקסט עבור ההערה:');
+    if (text && text.trim()) {
+      addAnnotation(latlng, text.trim());
+    }
+  }, true); // capture phase
+
+  // Esc exits annotation mode (handy after a few additions)
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && state.annotationMode) {
+      toggleAnnotationMode();
+    }
+  });
+
+  // Initial empty-list render
+  renderAnnotationsList();
 
   // ================================================================
   //  PDF EXPORT
